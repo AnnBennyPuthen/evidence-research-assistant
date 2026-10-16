@@ -20,6 +20,22 @@ describe('evidence inspection', () => {
 })
 
 describe('status presentation', () => {
+  it('opens the selected saved response and retains demo mode on a live server', async () => {
+    const saved = { run_id: 'old', mode: 'demo', status: 'completed', request: { question: 'How does the Moon orbit Earth?', depth: 'quick', preferred_domains: [] }, sources: [], evidence: [], claims: [], usage: {}, report: { overview: 'Saved synthetic example', findings: [], comparison: [], conflicts: [], gaps: [] } }
+    vi.stubGlobal('fetch', vi.fn().mockImplementation((url: string) => {
+      const body = url.endsWith('/config') ? { mode: 'live' }
+        : url.includes('/events?') ? { events: [], next_cursor: 0 }
+        : url.endsWith('/old') ? { result: saved }
+        : [{ id: 'old', mode: 'demo', question: saved.request.question, status: 'completed', created_at: '2026-01-01' }]
+      return Promise.resolve({ ok: true, json: async () => body })
+    }))
+    render(<App />)
+    fireEvent.click(await screen.findByRole('button', { name: /Moon orbit Earth/ }))
+    expect(await screen.findByText('Saved synthetic example')).toBeInTheDocument()
+    expect(screen.getByText('Selected run: demo mode')).toBeInTheDocument()
+    expect(screen.getByText('DEMO MODE')).toBeInTheDocument()
+  })
+
   it('shows API connectivity errors to the user', async () => {
     vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('offline')))
     render(<App />)

@@ -50,6 +50,7 @@ export interface Report {
 }
 
 export interface Result {
+  mode?: 'demo' | 'live' | 'unknown'
   run_id: string
   status: string
   request: { question: string; depth: 'quick' | 'standard'; preferred_domains: string[] }
@@ -63,6 +64,7 @@ export interface Result {
 }
 
 export interface RunSummary {
+  mode?: 'demo' | 'live' | 'unknown'
   id: string
   status: string
   question: string

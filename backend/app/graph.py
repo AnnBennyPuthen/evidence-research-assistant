@@ -94,6 +94,7 @@ def build_graph(roles: RoleAdapter, search, fetch, add_event):
                 {
                     "run_id": state["run_id"],
                     "task": task,
+                    "question": req.question,
                     "preferred_domains": req.preferred_domains,
                 },
             )
@@ -131,9 +132,13 @@ def build_graph(roles: RoleAdapter, search, fetch, add_event):
                     1 if content_type == "application/pdf" and "[Page 1]" in text else None
                 )
                 source = make_source(url, title, text, content_type)
-                excerpt = text[: min(220, len(text))]
+                excerpt = text[:5000]
                 fixture = None
             else:
+                if roles.settings.app_mode == "live":
+                    raise ProviderFailure(
+                        "Live research returned an invalid source; synthetic sources are forbidden"
+                    )
                 source = make_source(
                     item["url"], item["title"], item["text"], "text/plain", synthetic=True
                 )
@@ -151,15 +156,16 @@ def build_graph(roles: RoleAdapter, search, fetch, add_event):
                     {"demo_text": item["text"], "fixture": fixture},
                 )
             else:
-                try:
-                    claim = await roles.structured(
-                        "Researcher",
-                        CandidateClaim,
-                        "Extract one atomic, evidence-checkable technical claim. Do not include details absent from the passage.",
-                        {"question": task.question, "text": excerpt},
-                    )
-                except ProviderFailure:
-                    claim = CandidateClaim(text=excerpt)
+                claim = await roles.structured(
+                    "Researcher",
+                    CandidateClaim,
+                    "Extract one atomic claim relevant to the question, supported by this inspected passage. Do not include absent details.",
+                    {
+                        "question": state.get("question", task.question),
+                        "subquestion": task.question,
+                        "text": excerpt,
+                    },
+                )
             claim.evidence_ids = [passage.id]
             sources.append(source.model_dump(mode="json"))
             passages.append(passage.model_dump(mode="json"))
@@ -244,6 +250,7 @@ def build_graph(roles: RoleAdapter, search, fetch, add_event):
         results = []
         if roles.settings.app_mode == "live" and candidates:
             prompt_context = {
+                "question": state["request"]["question"],
                 "claims": [
                     {"id": c["id"], "text": c["text"], "candidate_evidence": c["evidence_ids"]}
                     for c in candidates
@@ -321,12 +328,13 @@ def build_graph(roles: RoleAdapter, search, fetch, add_event):
                             success_criteria=["Inspect a source that resolves the identified gap"],
                         ).model_dump()
                     )
+            add_event("verification", f"Assessed {len(results)} candidate claims", {})
             return {
-                "assessments": results,
+                "assessments": Overwrite(results),
                 "followups": followups,
                 "followup_round": round_number + (1 if followups else 0),
             }
-        else:
+        elif roles.settings.app_mode == "demo":
             # Demo fixtures deliberately exercise supported, conflicting, and insufficient outcomes.
             for candidate in candidates:
                 fixture = candidate.get("fixture")
@@ -406,6 +414,7 @@ def build_graph(roles: RoleAdapter, search, fetch, add_event):
                     {
                         "run_id": state["run_id"],
                         "task": task,
+                        "question": request.question,
                         "preferred_domains": request.preferred_domains,
                     },
                 )
@@ -458,9 +467,7 @@ def build_graph(roles: RoleAdapter, search, fetch, add_event):
             report.demo_label = None
         else:
             report = Report(
-                overview=(
-                    f"Limited evidence review of: {req.question}. Assessments describe retrieved evidence, not absolute truth."
-                ),
+                overview="Fixed synthetic LangGraph example. Arbitrary question input does not produce real research in demo mode.",
                 findings=evidence_claims,
                 comparison=conflicts,
                 conflicts=conflicts,
@@ -468,7 +475,8 @@ def build_graph(roles: RoleAdapter, search, fetch, add_event):
                 source_ids=list(dict.fromkeys(item["id"] for item in state.get("sources", []))),
                 demo_label=demo_label,
             )
-        report.overview = f"Limited evidence review for: {req.question}. Findings are bounded by inspected sources and do not establish absolute truth."
+        if roles.settings.app_mode == "demo":
+            report.overview = "Fixed synthetic LangGraph example. Arbitrary question input does not produce real research in demo mode."
         interpretation_findings = [
             (index, finding)
             for index, finding in enumerate(report.findings + report.comparison + report.conflicts)
@@ -539,6 +547,8 @@ def build_graph(roles: RoleAdapter, search, fetch, add_event):
                     report.gaps.append(
                         "Some synthesis or recommendation wording was omitted after the final evidence check."
                     )
+            except ProviderFailure:
+                raise
             except Exception:
                 report.findings = [item for item in report.findings if item.kind == "evidence"]
                 report.comparison = [item for item in report.comparison if item.kind == "evidence"]
@@ -547,6 +557,10 @@ def build_graph(roles: RoleAdapter, search, fetch, add_event):
                     "Synthesis was omitted because the final wording check could not be completed within the run budget."
                 )
         report = sanitize_report(report, assessments, state.get("sources", []))
+        if roles.settings.app_mode == "live" and not state.get("evidence"):
+            report.gaps.append(
+                "No usable source passages were retrieved; this run cannot establish an answer."
+            )
         add_event("report", "Structured report is ready", {})
         return {"report": report.model_dump(mode="json"), "status": "completed"}
 

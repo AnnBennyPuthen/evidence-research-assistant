@@ -1,6 +1,7 @@
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 
+import httpx
 import pytest
 
 from app.budget import RunBudget
@@ -70,6 +71,58 @@ def test_model_authentication_error_is_not_retried():
 
     calls, reservations = asyncio.run(scenario())
     assert (calls, reservations) == (1, 1)
+
+
+def test_exhausted_quota_fails_without_retry():
+    class QuotaFailure(Exception):
+        status_code = 429
+        body = {"code": "insufficient_quota"}
+
+    class Runnable:
+        calls = 0
+
+        async def ainvoke(self, value, config):
+            self.calls += 1
+            raise QuotaFailure()
+
+    async def scenario():
+        adapter = RoleAdapter(Settings(_env_file=None, app_mode="live"), RunBudget("quick"))
+        runnable = Runnable()
+        with pytest.raises(ProviderFailure, match="quota is exhausted"):
+            await adapter._invoke(runnable, "prompt", "Researcher")
+        assert runnable.calls == 1
+
+    asyncio.run(scenario())
+
+
+def test_temporary_rate_limit_honors_retry_after(monkeypatch):
+    delays = []
+
+    async def sleep(delay):
+        delays.append(delay)
+
+    monkeypatch.setattr("app.providers.asyncio.sleep", sleep)
+
+    class RateFailure(Exception):
+        status_code = 429
+        response = httpx.Response(429, headers={"retry-after": "7"})
+
+    class Runnable:
+        calls = 0
+
+        async def ainvoke(self, value, config):
+            self.calls += 1
+            if self.calls == 1:
+                raise RateFailure()
+            return "ok"
+
+    async def scenario():
+        adapter = RoleAdapter(Settings(_env_file=None, app_mode="live"), RunBudget("quick"))
+        assert await adapter._invoke(Runnable(), "prompt", "Researcher") == "ok"
+        assert adapter.budget.counts["models"] == 2
+
+    asyncio.run(scenario())
+    assert delays == [7]
 
 
 def test_report_sanitizer_rejects_fabricated_claim_and_source_ids():

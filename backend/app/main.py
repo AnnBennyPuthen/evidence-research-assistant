@@ -91,6 +91,7 @@ async def get_research(run_id: str):
     if not payload.get("run_id"):
         payload = {
             "run_id": run_id,
+            "mode": payload.get("mode", "unknown"),
             "status": row["status"],
             "request": payload.get(
                 "request",
@@ -100,7 +101,7 @@ async def get_research(run_id: str):
             "evidence": [],
             "claims": [],
             "report": None,
-            "usage": {"metrics_scope": "demo" if settings.app_mode == "demo" else "live"},
+            "usage": {"metrics_scope": payload.get("mode", "unknown")},
             "error": row["error"],
         }
     return {**row, "result": payload}
@@ -144,7 +145,7 @@ async def export_research(
         lines = [
             "# Evidence-Based Research Report",
             "",
-            report.get("demo_label") or "Live research",
+            report.get("demo_label") or f"Run mode: {payload.get('mode', 'unknown')}",
             "",
             report.get("overview", "No report available."),
             "",

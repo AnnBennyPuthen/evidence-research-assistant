@@ -28,7 +28,9 @@ class RunManager:
 
     async def start(self, request: ResearchRequest) -> str:
         run_id = f"run_{uuid4().hex[:12]}"
-        await asyncio.to_thread(self.repository.create_run, run_id, request.model_dump())
+        await asyncio.to_thread(
+            self.repository.create_run, run_id, request.model_dump(), self.settings.app_mode
+        )
         task = asyncio.create_task(self._execute(run_id, request), name=run_id)
         self.tasks[run_id] = task
         return run_id
@@ -36,9 +38,24 @@ class RunManager:
     async def _execute(self, run_id: str, request: ResearchRequest):
         started = time.monotonic()
         async with self.semaphore:
-            await asyncio.to_thread(
-                self.repository.save_result, run_id, "running", {"request": request.model_dump()}
+            initial_payload = {"request": request.model_dump(), "mode": self.settings.app_mode}
+            initial_write = asyncio.create_task(
+                asyncio.to_thread(self.repository.save_result, run_id, "running", initial_payload)
             )
+            try:
+                await asyncio.shield(initial_write)
+            except asyncio.CancelledError:
+                # A thread cannot be cancelled: finish its write before saving cancellation.
+                await initial_write
+                await asyncio.to_thread(
+                    self.repository.save_result,
+                    run_id,
+                    "cancelled",
+                    initial_payload,
+                    "Cancelled before research started.",
+                )
+                self.tasks.pop(run_id, None)
+                raise
             budget = RunBudget(request.depth)
             roles = RoleAdapter(self.settings, budget)
             cache: dict[str, dict] = {}
@@ -46,6 +63,7 @@ class RunManager:
             event_tasks: set[concurrent.futures.Future] = set()
             partial_payload = {
                 "run_id": run_id,
+                "mode": self.settings.app_mode,
                 "status": "running",
                 "request": request.model_dump(),
                 "sources": [],
@@ -54,8 +72,11 @@ class RunManager:
                 "report": None,
             }
 
+            event_lock = asyncio.Lock()
+
             async def persist_event(kind: str, message: str, data: dict):
-                await asyncio.to_thread(self.repository.add_event, run_id, kind, message, data)
+                async with event_lock:
+                    await asyncio.to_thread(self.repository.add_event, run_id, kind, message, data)
 
             def add_event(kind: str, message: str, data: dict | None = None):
                 if not message or "reasoning" in kind.lower():
@@ -77,6 +98,7 @@ class RunManager:
                 nonlocal partial_payload
                 partial_payload = {
                     "run_id": run_id,
+                    "mode": self.settings.app_mode,
                     "status": "running",
                     "request": request.model_dump(),
                     "plan": snapshot.get("plan"),
@@ -109,7 +131,7 @@ class RunManager:
                 }
                 if domains:
                     payload["include_domains"] = domains
-                    payload["include_domains_mode"] = "prefer"
+
                 async with httpx.AsyncClient(timeout=15) as client:
                     for attempt in range(2):
                         if not budget.reserve("searches"):
@@ -162,6 +184,7 @@ class RunManager:
                 )
                 result = ResearchResult(
                     run_id=run_id,
+                    mode=self.settings.app_mode,
                     status=status,
                     request=request,
                     plan=graph_result.get("plan"),
@@ -202,7 +225,7 @@ class RunManager:
                     partial_payload["error"],
                 )
             except Exception as exc:
-                logger.exception("Research run %s failed", run_id)
+                logger.error("Research run %s failed (%s)", run_id, type(exc).__name__)
                 await flush_events()
                 message = (
                     str(exc)
@@ -215,6 +238,7 @@ class RunManager:
                     self.repository.save_result, run_id, "failed", partial_payload, message
                 )
                 add_event("error", message)
+                await flush_events()
             finally:
                 self.tasks.pop(run_id, None)
 

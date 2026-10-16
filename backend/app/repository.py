@@ -35,7 +35,7 @@ class Repository:
                 (now,),
             )
 
-    def create_run(self, run_id: str, request: dict):
+    def create_run(self, run_id: str, request: dict, mode: str = "unknown"):
         now = datetime.now(UTC).isoformat()
         with self.connect() as db:
             db.execute(
@@ -46,7 +46,7 @@ class Repository:
                     request["depth"],
                     now,
                     now,
-                    json.dumps({"request": request}),
+                    json.dumps({"request": request, "mode": mode}),
                 ),
             )
 
@@ -77,15 +77,32 @@ class Repository:
             row = db.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
         if not row:
             return None
-        return {**dict(row), "payload": json.loads(row["payload"])}
+        payload = json.loads(row["payload"])
+        payload.setdefault("mode", self.payload_mode(payload))
+        return {**dict(row), "payload": payload}
+
+    @staticmethod
+    def payload_mode(payload: dict):
+        if payload.get("mode") in {"demo", "live"}:
+            return payload["mode"]
+        if (payload.get("report") or {}).get("demo_label") or any(
+            s.get("synthetic") for s in payload.get("sources", [])
+        ):
+            return "demo"
+        return payload.get("usage", {}).get("metrics_scope", "unknown")
 
     def list_runs(self, limit: int = 50):
         with self.connect() as db:
             rows = db.execute(
-                "SELECT id,status,question,depth,created_at,updated_at,error FROM runs ORDER BY created_at DESC LIMIT ?",
+                "SELECT id,status,question,depth,created_at,updated_at,error,payload FROM runs ORDER BY created_at DESC LIMIT ?",
                 (limit,),
             ).fetchall()
-        return [dict(row) for row in rows]
+        results = []
+        for row in rows:
+            item = dict(row)
+            item["mode"] = self.payload_mode(json.loads(item.pop("payload")))
+            results.append(item)
+        return results
 
     def events_after(self, run_id: str, cursor: int = 0, limit: int = 200):
         with self.connect() as db:

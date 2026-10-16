@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Activity, AlertCircle, ArrowDownToLine, BookOpenText, Check, ChevronRight, CircleHelp, Clock3, FileSearch, FlaskConical, LoaderCircle, Plus, Search, ShieldCheck, Square, X } from 'lucide-react'
 import { api, type Assessment, type EventItem, type Result, type RunSummary } from './api'
 
@@ -19,6 +19,7 @@ export function evidenceForClaim(claim: Assessment, result: Result) {
 }
 
 function App() {
+  const selection = useRef(0)
   const [mode, setMode] = useState<'demo' | 'live'>('demo')
   const [question, setQuestion] = useState('How does graph-based LLM orchestration compare with a linear workflow?')
   const [domains, setDomains] = useState('')
@@ -45,7 +46,7 @@ function App() {
         if (!active) return
         const nextResult = detail.result
         setResult(nextResult)
-        setEvents((current) => [...current, ...eventPage.events])
+        setEvents((current) => Array.from(new Map([...current, ...eventPage.events].map((item) => [item.id, item])).values()).sort((a, b) => a.id - b.id))
         setCursor(eventPage.next_cursor)
         if (['completed', 'partial'].includes(nextResult.status)) setViewState('completed')
         else if (nextResult.status === 'cancelled') setViewState('cancelled')
@@ -67,6 +68,7 @@ function App() {
 
   async function startResearch(event: React.FormEvent) {
     event.preventDefault()
+    const selected = ++selection.current
     setError('')
     setViewState('submitting')
     setResult(null)
@@ -75,8 +77,9 @@ function App() {
     setSelectedClaimId(null)
     try {
       const started = await api.create({ question, depth, preferred_domains: domains.split(',').map((item) => item.trim()).filter(Boolean) })
+      if (selected !== selection.current) return
       setViewState('running')
-      setResult({ run_id: started.run_id, status: started.status, request: { question, depth, preferred_domains: [] }, sources: [], evidence: [], claims: [], usage: { model_requests: 0, search_requests: 0, fetch_attempts: 0, elapsed_seconds: 0 } })
+      setResult({ mode, run_id: started.run_id, status: started.status, request: { question, depth, preferred_domains: [] }, sources: [], evidence: [], claims: [], usage: { model_requests: 0, search_requests: 0, fetch_attempts: 0, elapsed_seconds: 0 } })
       api.history().then(setHistory)
     } catch (cause) {
       setViewState('failed')
@@ -85,12 +88,18 @@ function App() {
   }
 
   async function openRun(id: string) {
+    const selected = ++selection.current
+    setResult(null)
+    setEvents([])
     try {
       setError('')
       const [detail, eventPage] = await Promise.all([api.detail(id), api.events(id, 0)])
+      if (selected !== selection.current) return
       setResult(detail.result)
       setQuestion(detail.result.request.question)
       setDepth(detail.result.request.depth)
+      setDomains(detail.result.request.preferred_domains.join(', '))
+      setError(detail.result.error ?? '')
       setEvents(eventPage.events)
       setCursor(eventPage.next_cursor)
       setViewState(['queued', 'running'].includes(detail.result.status) ? 'running' : detail.result.status === 'failed' ? 'failed' : 'completed')
@@ -112,13 +121,13 @@ function App() {
       <aside className="rail">
         <a className="brand" href="#top" aria-label="Evidence Desk home"><span className="brand-mark"><FileSearch size={19} /></span><span>evidence<span className="brand-light">desk</span></span></a>
         <div className="rail-label">WORKSPACE</div>
-        <button className="rail-action" onClick={() => { setViewState('idle'); setResult(null); setEvents([]); setError('') }}><Plus size={16} /> New investigation</button>
+        <button className="rail-action" onClick={() => { selection.current++; setViewState('idle'); setResult(null); setEvents([]); setError('') }}><Plus size={16} /> New investigation</button>
         <div className="rail-label history-label">RECENT RUNS <span>{history.length.toString().padStart(2, '0')}</span></div>
         <nav className="history-list" aria-label="Research history">
-          {history.map((run) => <button className={`history-item ${result?.run_id === run.id ? 'active' : ''}`} key={run.id} onClick={() => void openRun(run.id)}><span className="history-dot" data-status={run.status} /><span className="history-question">{run.question}</span><span className="history-date">{new Date(run.created_at).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}</span></button>)}
+          {history.map((run) => <button className={`history-item ${result?.run_id === run.id ? 'active' : ''}`} key={run.id} onClick={() => void openRun(run.id)}><span className="history-dot" data-status={run.status} /><span className="history-question">[{run.mode ?? 'unknown'}] {run.question}</span><span className="history-date">{new Date(run.created_at).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}</span></button>)}
           {history.length === 0 && <p className="history-empty">Your completed and active runs will appear here.</p>}
         </nav>
-        <div className="rail-bottom"><div className="mode-badge"><span className="mode-light" />{mode === 'demo' ? 'DEMO MODE' : 'LIVE MODE'}</div><p>Local single-user workspace</p><a href="../docs/limitations.md">Limitations <ChevronRight size={13} /></a></div>
+        <div className="rail-bottom"><div className="mode-badge"><span className="mode-light" />{(result?.mode ?? mode).toUpperCase()} MODE</div><p>Local single-user workspace</p><a href="../docs/limitations.md">Limitations <ChevronRight size={13} /></a></div>
       </aside>
 
       <main className="main-content" id="top">
@@ -130,6 +139,7 @@ function App() {
             <h1>What are you<br /><em>trying to establish?</em></h1>
             <p className="intro-copy">A bounded investigation with inspectable evidence for every assessed claim.</p>
 
+            {result?.mode && result.mode !== 'unknown' && <p>Selected run: {result.mode} mode</p>}
             <form className="research-form" onSubmit={startResearch}>
               <label htmlFor="research-question">Research question</label>
               <textarea id="research-question" value={question} onChange={(e) => setQuestion(e.target.value)} minLength={12} maxLength={700} required placeholder="Compare approaches, tools, or technical decisions..." />
@@ -146,7 +156,7 @@ function App() {
             <section className="activity-section" aria-label="Research activity">
               <div className="section-heading"><div><span className="micro-label">INVESTIGATION</span><h2>{viewState === 'running' || viewState === 'submitting' ? 'Research in progress' : result?.report ? 'Investigation complete' : 'Activity'}</h2></div>{viewState === 'running' && <button className="cancel-button" onClick={() => void cancelRun()}><Square size={13} /> Cancel</button>}</div>
               {(viewState === 'running' || viewState === 'submitting') && <div className="progress-strip"><span className="progress-indicator"><Activity size={15} /></span><div><strong>Working within the run budget</strong><p>Events below are workflow milestones, not private model reasoning.</p></div><LoaderCircle className="spin progress-spinner" size={16} /></div>}
-              <ol className="event-list">{events.map((item) => <li key={item.id}><span className="event-mark"><Check size={12} /></span><div><span className="event-kind">{item.kind}</span><p>{item.message}</p></div><time>{new Date().toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })}</time></li>)}{events.length === 0 && viewState === 'idle' && <li className="event-placeholder"><span className="event-mark muted"><Clock3 size={13} /></span><div><span className="event-kind">READY</span><p>Shape a question to begin. Demo mode uses synthetic evidence only.</p></div></li>}</ol>
+              <ol className="event-list">{events.map((item) => <li key={item.id}><span className="event-mark"><Check size={12} /></span><div><span className="event-kind">{item.kind}</span><p>{item.message}</p></div><time>{new Date(item.created_at).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })}</time></li>)}{events.length === 0 && viewState === 'idle' && <li className="event-placeholder"><span className="event-mark muted"><Clock3 size={13} /></span><div><span className="event-kind">READY</span><p>Shape a question to begin. Demo mode uses synthetic evidence only.</p></div></li>}</ol>
             </section>
 
             {result?.report && <section className="report-section" aria-label="Research report">

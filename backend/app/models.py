@@ -147,6 +147,7 @@ class Usage(BaseModel):
 
 class ResearchResult(BaseModel):
     run_id: str
+    mode: Literal["demo", "live", "unknown"] = "unknown"
     status: Literal["completed", "partial", "failed", "cancelled", "interrupted"]
     request: ResearchRequest
     plan: ResearchPlan | None = None

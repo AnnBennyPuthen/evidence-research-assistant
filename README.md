@@ -22,7 +22,7 @@ cd backend
 py -3.11 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements-lock.txt
-Copy-Item .env.example .env
+if (!(Test-Path .env)) { Copy-Item .env.example .env }
 # APP_MODE=demo is already the default; no provider keys are needed.
 uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 ```
@@ -67,11 +67,17 @@ Live mode never silently falls back to demo. Set these only in `backend/.env`:
 ```dotenv
 APP_MODE=live
 OPENAI_API_KEY=your-key
-OPENAI_MODEL=gpt-6-luna
+OPENAI_MODEL=gpt-4.1-mini
 TAVILY_API_KEY=your-key
 ```
 
-The model catalog checked for this implementation listed `gpt-6-luna` as the cost-sensitive flagship and documented tools. Confirm the current model catalog and pricing before live work; pricing and availability can change. You can set another documented tool-calling and structured-output-compatible model with `OPENAI_MODEL`. Live research makes billable provider requests. Automated tests and normal demo use do not.
+`gpt-4.1-mini` supports function calling and structured outputs ([official model documentation](https://developers.openai.com/api/docs/models/gpt-4.1-mini)). Live validation remains pending until you configure credentials and run it yourself.
+
+The backend loads **backend/.env by absolute path**, regardless of working directory. Shell environment variables override this file. Remove stale APP_MODE shell overrides and restart the backend after editing .env; settings are cached. DATABASE_PATH is still relative to the working directory, so start from backend/. Never put provider credentials in frontend environment files.
+
+Demo mode is a fixed synthetic LangGraph example: arbitrary question input does not perform real research. Saved runs retain their mode; legacy runs lacking metadata show unknown.
+
+Manual live test: confirm /api/health reports live, open http://127.0.0.1:5173, leave preferred domains empty, and submit ?How does the Moon orbit Earth??. Then submit ?How does retrieval augmented generation reduce hallucinations in language models??. Check different plans, actual source URLs, question-specific claims, and verification before report events. Reopen both from history and confirm the selected response and saved mode. Old demo reports must remain labelled demo.
 
 ## Run Checks
 

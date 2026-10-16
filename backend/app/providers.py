@@ -100,7 +100,7 @@ class RoleAdapter:
             f"Request context: {context}\nTask: {prompt}"
         )
         return await self._invoke(
-            self._chat().with_structured_output(schema),
+            self._chat().with_structured_output(schema, method="function_calling"),
             instructions,
             role,
             critical=role in {"Evidence Verifier", "Report Writer"},
@@ -117,14 +117,46 @@ class RoleAdapter:
             except Exception as exc:
                 response = getattr(exc, "response", None)
                 status = getattr(exc, "status_code", None) or getattr(response, "status_code", None)
+                body = getattr(exc, "body", None)
+                error = body.get("error", body) if isinstance(body, dict) else {}
+                code = error.get("code") if isinstance(error, dict) else None
+                if code in {
+                    "insufficient_quota",
+                    "billing_hard_limit_reached",
+                    "credit_balance_exhausted",
+                    "organization_spend_limit_exceeded",
+                    "project_spend_limit_exceeded",
+                    "organization_usage_limit_exceeded",
+                }:
+                    raise ProviderFailure(
+                        f"{role}: OpenAI API quota is exhausted. Check API billing, credits, "
+                        "and the project usage limits for your API key. Retrying will not fix exhausted quota."
+                    ) from exc
                 transient = (
                     isinstance(exc, (httpx.TimeoutException, httpx.NetworkError))
                     or status in {408, 409, 429}
                     or (isinstance(status, int) and status >= 500)
                 )
                 if attempt == 0 and transient:
-                    await asyncio.sleep(0.35)
+                    delay = 0.35
+                    if status == 429:
+                        headers = getattr(response, "headers", {}) or {}
+                        try:
+                            delay = float(headers.get("retry-after", "5"))
+                        except (TypeError, ValueError):
+                            delay = 5
+                        if not 0 <= delay <= 30:
+                            raise ProviderFailure(
+                                f"{role}: OpenAI rate limit reached. Wait before starting another run; "
+                                "check your API project's model request/token limits."
+                            ) from exc
+                    await asyncio.sleep(delay)
                     continue
+                if status == 429:
+                    raise ProviderFailure(
+                        f"{role}: OpenAI rate limit reached after one retry. Wait before starting "
+                        "another run and check API billing and model request/token limits."
+                    ) from exc
                 raise ProviderFailure(
                     f"{role} provider request failed: {type(exc).__name__}"
                 ) from exc
@@ -210,7 +242,13 @@ class RoleAdapter:
                     )
                     if name == "inspect_url" and output.startswith("TITLE:"):
                         inspected.append({"tool_output": output})
+                except ProviderFailure:
+                    raise
                 except Exception as exc:
+                    if name == "search_web":
+                        raise ProviderFailure(
+                            f"Tavily search failed: {type(exc).__name__}"
+                        ) from exc
                     output = f"Tool failed: {type(exc).__name__}"
                 from langchain_core.messages import ToolMessage
 

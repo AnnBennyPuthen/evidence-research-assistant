@@ -37,10 +37,14 @@ def test_demo_api_completes_with_events_and_exports(tmp_path, monkeypatch):
 
             time.sleep(0.02)
         assert result["status"] == "completed", result
+        assert result["mode"] == "demo"
+        assert client.get("/api/research").json()[0]["mode"] == "demo"
         assert result["report"]["demo_label"] == "Demo — synthetic evidence; no live research"
         event_response = client.get(f"/api/research/{run_id}/events?cursor=0")
         assert event_response.status_code == 200
         assert any(event["kind"] == "report" for event in event_response.json()["events"])
+        kinds = [event["kind"] for event in event_response.json()["events"]]
+        assert kinds.index("verification") < kinds.index("report")
         assert client.get(f"/api/research/{run_id}/export?format=markdown").text.startswith(
             "# Evidence-Based Research Report"
         )
