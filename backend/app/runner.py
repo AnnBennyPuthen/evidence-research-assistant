@@ -6,12 +6,13 @@ from uuid import uuid4
 
 import httpx
 
-from .budget import RunBudget
+from .budget import BudgetExhausted, RunBudget
 from .config import Settings
-from .evidence import canonicalize_url
+from .evidence import canonicalize_url, make_source, select_passages
 from .fetcher import fetch_public
 from .graph import run_research
-from .models import ResearchRequest, ResearchResult
+from .grounding import deterministic_report
+from .models import ClaimAssessment, ResearchRequest, ResearchResult
 from .providers import ProviderFailure, RoleAdapter
 from .repository import Repository
 
@@ -106,12 +107,7 @@ class RunManager:
                     "evidence": snapshot.get("evidence", []),
                     "claims": snapshot.get("assessments", []),
                     "report": snapshot.get("report"),
-                    "usage": {
-                        "metrics_scope": "demo" if self.settings.app_mode == "demo" else "live",
-                        "search_requests": budget.counts["searches"],
-                        "fetch_attempts": budget.counts["fetches"],
-                        "ended_by_limit": budget.ended_by_limit,
-                    },
+                    "usage": roles.usage().model_dump(),
                 }
                 await asyncio.to_thread(
                     self.repository.save_result, run_id, "running", partial_payload
@@ -134,8 +130,7 @@ class RunManager:
 
                 async with httpx.AsyncClient(timeout=15) as client:
                     for attempt in range(2):
-                        if not budget.reserve("searches"):
-                            return []
+                        budget.require("searches")
                         response = await client.post(
                             "https://api.tavily.com/search",
                             json=payload,
@@ -156,8 +151,7 @@ class RunManager:
                     if normalized in cache:
                         budget.counts["cached_calls"] += 1
                         return cache[normalized]
-                    if not budget.reserve("fetches"):
-                        return {"status": "failed", "reason": "Fetch attempt budget reached"}
+                    budget.require("fetches")
                     result = await fetch_public(
                         url,
                         max_bytes=self.settings.max_fetch_bytes,
@@ -167,8 +161,24 @@ class RunManager:
                     if result.get("status") == "ok":
                         cache[normalized] = result
                     return result
+                except BudgetExhausted:
+                    raise
                 except Exception as exc:
-                    return {"status": "failed", "reason": str(exc)[:200]}
+                    return {"status": "failed", "reason": type(exc).__name__}
+
+            def retain_inspections():
+                urls = {s["canonical_url"] for s in partial_payload.get("sources", [])}
+                for record in roles.inspected:
+                    if record["url"] in urls:
+                        continue
+                    source = make_source(record["url"], record["title"], record["text"],
+                                         record["content_type"], normalized=True)
+                    partial_payload.setdefault("sources", []).append(source.model_dump(mode="json"))
+                    partial_payload.setdefault("evidence", []).extend(p.model_dump(mode="json") for p in
+                        select_passages(source, request.question, record.get("page_ranges", [])))
+                    urls.add(record["url"])
+                partial_payload["usage"] = roles.usage().model_dump()
+                partial_payload["usage"]["elapsed_seconds"] = round(time.monotonic() - started, 2)
 
             try:
                 graph_result, usage = await asyncio.wait_for(
@@ -199,6 +209,7 @@ class RunManager:
                 )
             except asyncio.CancelledError:
                 await flush_events()
+                retain_inspections()
                 partial_payload["status"] = "cancelled"
                 await asyncio.to_thread(
                     self.repository.save_result,
@@ -209,7 +220,13 @@ class RunManager:
                 )
                 raise
             except TimeoutError:
+                budget.ended_by_limit = "seconds"
                 await flush_events()
+                retain_inspections()
+                partial_payload["report"] = deterministic_report(
+                    [ClaimAssessment.model_validate(a) for a in partial_payload.get("claims", [])],
+                    partial_payload.get("sources", []), partial=True
+                ).model_dump(mode="json")
                 partial_payload["status"] = "partial"
                 partial_payload["error"] = "Run time limit reached; the saved evidence is partial."
                 partial_payload["usage"] = {
@@ -227,6 +244,7 @@ class RunManager:
             except Exception as exc:
                 logger.error("Research run %s failed (%s)", run_id, type(exc).__name__)
                 await flush_events()
+                retain_inspections()
                 message = (
                     str(exc)
                     if isinstance(exc, ProviderFailure)

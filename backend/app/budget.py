@@ -21,6 +21,14 @@ LIMITS = {
 }
 
 
+class BudgetExhausted(RuntimeError):
+    """Expected bounded-work stop, distinct from provider failure."""
+
+    def __init__(self, kind: str):
+        self.kind = kind
+        super().__init__(f"{kind} budget exhausted")
+
+
 @dataclass
 class RunBudget:
     depth: str
@@ -39,6 +47,10 @@ class RunBudget:
                 return False
             self.counts[kind] += amount
             return True
+
+    def require(self, kind: str, *, critical: bool = False):
+        if not self.reserve(kind, critical=critical):
+            raise BudgetExhausted(kind)
 
     @property
     def limits(self) -> dict[str, int]:

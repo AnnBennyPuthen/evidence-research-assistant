@@ -8,9 +8,9 @@ from app.budget import RunBudget
 from app.config import Settings
 from app.graph import run_research
 from app.models import (
-    CandidateClaim,
+    CandidateClaimDraft,
     Report,
-    ResearchPlan,
+    ResearchPlanDraft,
     ResearchRequest,
     ResearchTask,
     VerificationOutput,
@@ -25,9 +25,9 @@ class MockModel:
                 context = ast.literal_eval(
                     value.split("Request context: ", 1)[1].split("\nTask:", 1)[0]
                 )
-                if schema is ResearchPlan:
+                if schema is ResearchPlanDraft:
                     question = context["question"]
-                    return ResearchPlan(
+                    return ResearchPlanDraft(
                         overview=question,
                         tasks=[
                             ResearchTask(
@@ -37,8 +37,8 @@ class MockModel:
                             )
                         ],
                     )
-                if schema is CandidateClaim:
-                    return CandidateClaim(text=context["text"])
+                if schema is CandidateClaimDraft:
+                    return CandidateClaimDraft(text=context["text"])
                 if schema is VerificationOutput:
                     return VerificationOutput(
                         assessments=[

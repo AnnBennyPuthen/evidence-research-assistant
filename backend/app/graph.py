@@ -5,19 +5,23 @@ from typing import Annotated, TypedDict
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Overwrite, Send
 
-from .evidence import make_passage, make_source
+from .budget import BudgetExhausted
+from .evidence import make_passage, make_source, select_passages
+from .grounding import deterministic_report, sanitize_report, synthesis_context, validate_assessments
 from .models import (
     CandidateClaim,
+    CandidateClaimDraft,
     ClaimAssessment,
     EvidencePassage,
     Report,
     ReportFinding,
     ReportWordingOutput,
     ResearchPlan,
+    ResearchPlanDraft,
     ResearchRequest,
     ResearchTask,
     SourceDocument,
-    Usage,
+    new_id,
     VerificationOutput,
 )
 from .providers import ProviderFailure, RoleAdapter
@@ -39,44 +43,20 @@ class State(TypedDict, total=False):
     status: str
 
 
-def sanitize_report(
-    report: Report, assessments: list[ClaimAssessment], sources: list[dict]
-) -> Report:
-    assessment_by_id = {item.claim_id: item for item in assessments}
-    valid_claim_ids = set(assessment_by_id)
-    valid_source_ids = {item["id"] for item in sources}
-
-    def clean(findings: list[ReportFinding]) -> list[ReportFinding]:
-        accepted = []
-        for finding in findings:
-            finding.claim_ids = [ident for ident in finding.claim_ids if ident in valid_claim_ids]
-            finding.premise_claim_ids = [
-                ident for ident in finding.premise_claim_ids if ident in valid_claim_ids
-            ]
-            if finding.kind == "evidence":
-                if not finding.claim_ids:
-                    continue
-                finding.text = assessment_by_id[finding.claim_ids[0]].text
-            elif not finding.premise_claim_ids:
-                continue
-            accepted.append(finding)
-        return accepted
-
-    report.findings = clean(report.findings)
-    report.comparison = clean(report.comparison)
-    report.conflicts = clean(report.conflicts)
-    report.source_ids = [ident for ident in report.source_ids if ident in valid_source_ids]
-    return report
-
-
 def build_graph(roles: RoleAdapter, search, fetch, add_event):
     researcher_semaphore = asyncio.Semaphore(2)
 
     async def planner(state: State):
         req = ResearchRequest.model_validate(state["request"])
-        plan = await roles.structured(
-            "Planner", ResearchPlan, req.question, {"question": req.question}
-        )
+        try:
+            draft = await roles.structured(
+                "Planner", ResearchPlanDraft, req.question, {"question": req.question}
+            )
+            draft = ResearchPlanDraft.model_validate(draft.model_dump())
+            plan = ResearchPlan(overview=draft.overview, comparison_dimensions=draft.comparison_dimensions,
+                                tasks=[ResearchTask(**task.model_dump()) for task in draft.tasks])
+        except BudgetExhausted:
+            return {"plan": None}
         max_tasks = roles.budget.limits["tasks"]
         plan.tasks = plan.tasks[:max_tasks]
         add_event(
@@ -88,6 +68,8 @@ def build_graph(roles: RoleAdapter, search, fetch, add_event):
 
     def dispatch(state: State):
         req = ResearchRequest.model_validate(state["request"])
+        if not state.get("plan"):
+            return "writer"
         return [
             Send(
                 "researcher",
@@ -110,66 +92,30 @@ def build_graph(roles: RoleAdapter, search, fetch, add_event):
             )
         sources, passages, candidates = [], [], []
         for item in items:
-            if item.get("tool_output"):
-                lines = item["tool_output"].splitlines()
-                text = item["tool_output"].split("TEXT: ", 1)[-1]
-                title = next(
-                    (line.removeprefix("TITLE: ") for line in lines if line.startswith("TITLE: ")),
-                    "Untitled source",
-                )
-                url = next(
-                    (line.removeprefix("URL: ") for line in lines if line.startswith("URL: ")), ""
-                )
-                content_type = next(
-                    (
-                        line.removeprefix("CONTENT_TYPE: ")
-                        for line in lines
-                        if line.startswith("CONTENT_TYPE: ")
-                    ),
-                    "text/html",
-                )
-                page_number = (
-                    1 if content_type == "application/pdf" and "[Page 1]" in text else None
-                )
-                source = make_source(url, title, text, content_type)
-                excerpt = text[:5000]
-                fixture = None
-            else:
-                if roles.settings.app_mode == "live":
-                    raise ProviderFailure(
-                        "Live research returned an invalid source; synthetic sources are forbidden"
-                    )
-                source = make_source(
-                    item["url"], item["title"], item["text"], "text/plain", synthetic=True
-                )
-                excerpt = item["text"]
-                fixture = item.get("fixture")
-            passage = make_passage(source, excerpt)
-            if not passage:
-                continue
-            passage.page_number = page_number if item.get("tool_output") else None
-            if roles.settings.app_mode == "demo":
-                claim = await roles.structured(
-                    "Researcher",
-                    CandidateClaim,
-                    "Extract one atomic candidate claim.",
-                    {"demo_text": item["text"], "fixture": fixture},
-                )
-            else:
-                claim = await roles.structured(
-                    "Researcher",
-                    CandidateClaim,
-                    "Extract one atomic claim relevant to the question, supported by this inspected passage. Do not include absent details.",
-                    {
-                        "question": state.get("question", task.question),
-                        "subquestion": task.question,
-                        "text": excerpt,
-                    },
-                )
-            claim.evidence_ids = [passage.id]
+            demo = roles.settings.app_mode == "demo"
+            if not demo and (item.get("fixture") or item.get("synthetic") or not item.get("text")):
+                raise ProviderFailure("Invalid live source record; synthetic sources are forbidden")
+            source = make_source(item["url"], item["title"], item["text"],
+                                 item.get("content_type", "text/plain"), synthetic=demo, normalized=not demo)
             sources.append(source.model_dump(mode="json"))
-            passages.append(passage.model_dump(mode="json"))
-            candidates.append({**claim.model_dump(), "fixture": fixture})
+            selected = ([make_passage(source, source.normalized_text)] if demo else
+                        select_passages(source, task.question, item.get("page_ranges", [])))
+            for passage in selected:
+                if passage is None:
+                    raise ProviderFailure("Inspected source did not yield an exact evidence passage")
+                passages.append(passage.model_dump(mode="json"))
+                try:
+                    draft = await roles.structured(
+                        "Researcher", CandidateClaimDraft,
+                        "Extract one atomic claim relevant to the question, supported by this inspected passage. Do not include absent details.",
+                        {"question": state.get("question", task.question), "subquestion": task.question,
+                         "text": passage.excerpt, **({"demo_text": item["text"]} if demo else {})},
+                    )
+                    draft = CandidateClaimDraft.model_validate(draft.model_dump())
+                except BudgetExhausted:
+                    continue
+                claim = CandidateClaim(text=draft.text, evidence_ids=[passage.id])
+                candidates.append({**claim.model_dump(), "fixture": item.get("fixture") if demo else None})
         return {
             "sources": sources,
             "evidence": passages,
@@ -218,6 +164,7 @@ def build_graph(roles: RoleAdapter, search, fetch, add_event):
             passages.append(passage.model_dump(mode="json"))
         candidates = []
         candidate_keys = set()
+        candidate_ids = set()
         for candidate in state.get("candidates", []):
             candidate["evidence_ids"] = list(
                 dict.fromkeys(
@@ -229,6 +176,9 @@ def build_graph(roles: RoleAdapter, search, fetch, add_event):
             key = (" ".join(candidate["text"].split()).casefold(), tuple(candidate["evidence_ids"]))
             if candidate["evidence_ids"] and key not in candidate_keys:
                 candidate_keys.add(key)
+                if candidate["id"] in candidate_ids:
+                    candidate["id"] = new_id("claim")
+                candidate_ids.add(candidate["id"])
                 candidates.append(candidate)
         add_event(
             "merge", f"Merged parallel results into {len(sources)} unique inspected sources", {}
@@ -264,62 +214,25 @@ def build_graph(roles: RoleAdapter, search, fetch, add_event):
                     for source in source_map.values()
                 ],
             }
-            output = await roles.structured(
-                "Evidence Verifier",
-                VerificationOutput,
-                "Assess each atomic claim against only the supplied inspected passages. Use only supplied claim/evidence IDs. "
-                "A supported assessment requires direct support; conflicting requires both support and counterevidence, and "
-                "otherwise use insufficient. Note date, version, and scope limitations. Request follow-up questions only for material gaps.",
-                prompt_context,
-            )
-            verified = []
-            candidate_by_id = {item["id"]: item for item in candidates}
-            usable_ids = {
-                p.id for p in passage_map.values() if p.usable and p.source_id in source_map
-            }
-            for draft in output.assessments:
-                candidate = candidate_by_id.get(draft.claim_id)
-                if not candidate:
-                    continue
-                support = [
-                    ident
-                    for ident in draft.supporting_evidence_ids
-                    if ident in usable_ids and ident in candidate["evidence_ids"]
-                ]
-                contradict = [
-                    ident for ident in draft.contradicting_evidence_ids if ident in usable_ids
-                ]
-                status = draft.status
-                if status == "supported" and not support:
-                    status = "insufficient"
-                if status == "conflicting" and not (support and contradict):
-                    status = "insufficient"
-                verified.append(
-                    ClaimAssessment(
-                        claim_id=candidate["id"],
-                        text=candidate["text"],
-                        status=status,
-                        supporting_evidence_ids=support,
-                        contradicting_evidence_ids=contradict,
-                        explanation=draft.explanation,
-                    ).model_dump()
+            try:
+                output = await roles.structured(
+                    "Evidence Verifier", VerificationOutput,
+                    "Assess each atomic claim against the supplied inspected passages. Return exactly one assessment per claim. "
+                    "Support and counterevidence must be different passage IDs. Conflicting requires both sides. "
+                    "Otherwise use insufficient. Request follow-up only for material gaps.", prompt_context,
                 )
-            assessed_ids = {item["claim_id"] for item in verified}
-            verified.extend(
-                ClaimAssessment(
-                    claim_id=candidate["id"],
-                    text=candidate["text"],
-                    status="insufficient",
-                    explanation="The verifier did not return an assessment for this candidate.",
-                ).model_dump()
-                for candidate in candidates
-                if candidate["id"] not in assessed_ids
-            )
-            results = verified
+                results = validate_assessments(output, candidates, state.get("evidence", []))
+            except BudgetExhausted:
+                previous = {a["claim_id"]: a for a in state.get("assessments", [])}
+                results = [previous.get(c["id"], ClaimAssessment(
+                    claim_id=c["id"], text=c["text"], status="insufficient",
+                    explanation="Verification unavailable within the remaining budget."
+                ).model_dump()) for c in candidates]
+                output = VerificationOutput(assessments=[])
             max_rounds = roles.budget.limits["followups"]
             round_number = state.get("followup_round", 0)
             followups = []
-            if round_number < max_rounds:
+            if round_number < max_rounds and not roles.budget.ended_by_limit:
                 for question in output.follow_up_questions[:3]:
                     followups.append(
                         ResearchTask(
@@ -406,7 +319,7 @@ def build_graph(roles: RoleAdapter, search, fetch, add_event):
 
     def route_after_verify(state: State):
         followups = state.get("followups", [])
-        if followups:
+        if followups and not roles.budget.ended_by_limit:
             request = ResearchRequest.model_validate(state["request"])
             return [
                 Send(
@@ -423,146 +336,66 @@ def build_graph(roles: RoleAdapter, search, fetch, add_event):
         return "writer"
 
     async def writer(state: State):
-        assessments_by_id = {
-            item["claim_id"]: ClaimAssessment.model_validate(item)
-            for item in state.get("assessments", [])
-        }
-        assessments = list(assessments_by_id.values())
-        evidence_claims = [
-            ReportFinding(
-                heading="Supported by retrieved evidence",
-                text=item.text,
-                claim_ids=[item.claim_id],
-            )
-            for item in assessments
-            if item.status == "supported"
-        ]
-        conflicts = [
-            ReportFinding(heading="Conflicting evidence", text=item.text, claim_ids=[item.claim_id])
-            for item in assessments
-            if item.status == "conflicting"
-        ]
-        gaps = [item.text for item in assessments if item.status == "insufficient"]
-        req = ResearchRequest.model_validate(state["request"])
-        demo_label = (
-            "Demo — synthetic evidence; no live research"
-            if roles.settings.app_mode == "demo"
-            else None
-        )
-        if roles.settings.app_mode == "live":
-            report = await roles.structured(
-                "Report Writer",
-                Report,
-                "Write a bounded structured report. Every factual finding must use supplied assessed claim IDs; synthesis/recommendations must state premises. "
-                "Do not add URLs, dates, quotes, or claims. Do not treat insufficient/conflicting assessments as established findings.",
-                {
-                    "question": req.question,
-                    "assessments": [item.model_dump() for item in assessments],
-                    "sources": [
-                        {"id": item["id"], "title": item["title"], "domain": item["domain"]}
-                        for item in state.get("sources", [])
-                    ],
-                },
-            )
-            report.demo_label = None
-        else:
-            report = Report(
-                overview="Fixed synthetic LangGraph example. Arbitrary question input does not produce real research in demo mode.",
-                findings=evidence_claims,
-                comparison=conflicts,
-                conflicts=conflicts,
-                gaps=gaps or ["Live source dates and version coverage require further checking."],
-                source_ids=list(dict.fromkeys(item["id"] for item in state.get("sources", []))),
-                demo_label=demo_label,
-            )
-        if roles.settings.app_mode == "demo":
-            report.overview = "Fixed synthetic LangGraph example. Arbitrary question input does not produce real research in demo mode."
-        interpretation_findings = [
-            (index, finding)
-            for index, finding in enumerate(report.findings + report.comparison + report.conflicts)
-            if finding.kind != "evidence"
-        ]
-        if roles.settings.app_mode == "live" and interpretation_findings:
-            context = [
-                {
-                    "finding_index": index,
-                    "text": finding.text,
-                    "claim_ids": finding.claim_ids,
-                    "premise_claim_ids": finding.premise_claim_ids,
-                }
-                for index, finding in interpretation_findings
-            ]
-            context.append(
-                {
-                    "evidence": [
-                        {"id": item.id, "excerpt": item.excerpt}
-                        for item in (
-                            EvidencePassage.model_validate(raw) for raw in state.get("evidence", [])
-                        )
-                    ]
-                }
-            )
+        assessments = [ClaimAssessment.model_validate(a) for a in state.get("assessments", [])]
+        sources = state.get("sources", [])
+        demo = roles.settings.app_mode == "demo"
+        partial = bool(roles.budget.ended_by_limit)
+        report = deterministic_report(assessments, sources, partial=partial)
+        if not demo:
             try:
-                wording = await roles.structured(
-                    "Evidence Verifier",
-                    ReportWordingOutput,
-                    "Review only the supplied report wording against its linked assessed premises and inspected evidence. "
-                    "Assess whether the exact wording is supported, conflicting, or insufficient. Do not request searches or follow-up work.",
-                    {"report_items": context},
+                draft = await roles.structured(
+                    "Report Writer", Report,
+                    "Write a bounded report using assessed claims. Established findings require supported claims. "
+                    "Keep conflicting evidence separate; interpretations need premise claim IDs and qualifications.",
+                    {"question": state["request"]["question"],
+                     "assessments": [a.model_dump() for a in assessments],
+                     "sources": [{k: source[k] for k in ("id", "title", "domain")} for source in sources]},
                 )
-                valid_indices = {
-                    index
-                    for index, finding in interpretation_findings
-                    if (finding.kind == "synthesis" and finding.premise_claim_ids)
-                    or (finding.kind == "recommendation" and finding.premise_claim_ids)
-                }
-                accepted_indices = {
-                    item.finding_index
-                    for item in wording.assessments
-                    if item.finding_index in valid_indices
-                    and item.status in {"supported", "conflicting"}
-                }
-                all_findings = report.findings + report.comparison + report.conflicts
-                keep = {
-                    index
-                    for index, finding in enumerate(all_findings)
-                    if finding.kind == "evidence" or index in accepted_indices
-                }
-                report.findings = [
-                    item
-                    for index, item in enumerate(all_findings)
-                    if index in keep and item in report.findings
-                ]
-                report.comparison = [
-                    item
-                    for index, item in enumerate(all_findings)
-                    if index in keep and item in report.comparison
-                ]
-                report.conflicts = [
-                    item
-                    for index, item in enumerate(all_findings)
-                    if index in keep and item in report.conflicts
-                ]
-                if len(accepted_indices) < len(interpretation_findings):
-                    report.gaps.append(
-                        "Some synthesis or recommendation wording was omitted after the final evidence check."
-                    )
-            except ProviderFailure:
-                raise
-            except Exception:
-                report.findings = [item for item in report.findings if item.kind == "evidence"]
-                report.comparison = [item for item in report.comparison if item.kind == "evidence"]
-                report.conflicts = [item for item in report.conflicts if item.kind == "evidence"]
-                report.gaps.append(
-                    "Synthesis was omitted because the final wording check could not be completed within the run budget."
-                )
-        report = sanitize_report(report, assessments, state.get("sources", []))
-        if roles.settings.app_mode == "live" and not state.get("evidence"):
-            report.gaps.append(
-                "No usable source passages were retrieved; this run cannot establish an answer."
-            )
-        add_event("report", "Structured report is ready", {})
-        return {"report": report.model_dump(mode="json"), "status": "completed"}
+                draft.demo_label = None
+                # Reject invalid references/statuses and constrain free text before semantic checking.
+                draft = sanitize_report(draft, assessments, sources, allow_interpretation=True)
+                items = synthesis_context(draft, assessments, state.get("evidence", []), sources)
+                if items:
+                    try:
+                        wording = await roles.structured(
+                            "Evidence Verifier", ReportWordingOutput,
+                            "Check exact interpretation wording against the full assessed premises and their linked "
+                            "support/counterevidence. Preserve uncertainty. Return one assessment per finding_index. "
+                            "Unsupported generalizations are insufficient; disputed interpretations are conflicting.",
+                            {"question": state["request"]["question"], "report_items": items},
+                        )
+                        by_index = {}
+                        for assessment in wording.assessments:
+                            by_index.setdefault(assessment.finding_index, []).append(assessment)
+                        index = 0
+                        for section in ("findings", "comparison", "conflicts"):
+                            accepted = []
+                            for finding in getattr(draft, section):
+                                if finding.kind == "evidence":
+                                    accepted.append(finding)
+                                    continue
+                                checks = by_index.get(index, [])
+                                index += 1
+                                if len(checks) == 1 and checks[0].status in {"supported", "conflicting"}:
+                                    finding.qualification = ("conflicting" if finding.qualification == "conflicting"
+                                                             else checks[0].status)
+                                    accepted.append(finding)
+                            setattr(draft, section, accepted)
+                    except BudgetExhausted:
+                        for section in ("findings", "comparison", "conflicts"):
+                            setattr(draft, section, [f for f in getattr(draft, section) if f.kind == "evidence"])
+                report = sanitize_report(draft, assessments, sources, allow_interpretation=True)
+            except BudgetExhausted:
+                report = deterministic_report(assessments, sources, partial=True)
+            partial = bool(roles.budget.ended_by_limit)
+            if partial and not report.overview.startswith("Partial"):
+                report.overview = "Partial investigation. " + report.overview
+                report.gaps.append("Run budget reached; further research or interpretation checks were omitted.")
+        else:
+            report.demo_label = "Demo ? synthetic evidence; no live research"
+            report.overview = "Fixed synthetic LangGraph example. Arbitrary question input does not produce real research in demo mode."
+        add_event("report", "Partial report is ready" if partial else "Structured report is ready", {})
+        return {"report": report.model_dump(mode="json"), "status": "partial" if partial else "completed"}
 
     builder = StateGraph(State)
     builder.add_node("planner", planner)
@@ -571,7 +404,7 @@ def build_graph(roles: RoleAdapter, search, fetch, add_event):
     builder.add_node("verifier", verifier)
     builder.add_node("writer", writer)
     builder.add_edge(START, "planner")
-    builder.add_conditional_edges("planner", dispatch, ["researcher"])
+    builder.add_conditional_edges("planner", dispatch, ["researcher", "writer"])
     builder.add_edge("researcher", "merge_findings")
     builder.add_edge("merge_findings", "verifier")
     builder.add_conditional_edges("verifier", route_after_verify, ["researcher", "writer"])
@@ -612,17 +445,4 @@ async def run_research(
                     result[key] = value
         if on_update:
             await on_update(result)
-    budget = roles.budget
-    demo = roles.settings.app_mode == "demo"
-    usage = Usage(
-        model_requests=0 if demo else budget.counts["models"],
-        scripted_model_steps=budget.counts["models"] if demo else 0,
-        metrics_scope="demo" if demo else "live",
-        input_tokens=roles.input_tokens,
-        output_tokens=roles.output_tokens,
-        search_requests=budget.counts["searches"],
-        fetch_attempts=budget.counts["fetches"],
-        cached_calls=budget.counts["cached_calls"],
-        ended_by_limit=budget.ended_by_limit,
-    )
-    return result, usage
+    return result, roles.usage()

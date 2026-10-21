@@ -71,30 +71,37 @@ async def fetch_public(url: str, *, max_bytes: int, max_pages: int, max_chars: i
                 content_type = response.headers.get("content-type", "").split(";", 1)[0].lower()
                 final_url = str(response.url)
                 title = "Untitled source"
-                page_number = None
+                pages = []
                 if content_type == "application/pdf" or body[:4] == b"%PDF":
 
                     def parse_pdf():
                         reader = PdfReader(io.BytesIO(body), strict=False)
                         return [
-                            f"[Page {page_index + 1}] {page.extract_text() or ''}"
+                            {"page_number": page_index + 1, "text": page.extract_text() or ""}
                             for page_index, page in enumerate(reader.pages[:max_pages])
                         ]
 
                     page_text = await asyncio.wait_for(asyncio.to_thread(parse_pdf), timeout=12)
-                    text = " ".join(" ".join(page_text).split())
+                    remaining = max_chars
+                    for page in page_text:
+                        bounded = page["text"][:remaining]
+                        pages.append({**page, "text": bounded})
+                        remaining -= len(bounded)
+                        if remaining <= 0:
+                            break
+                    text = " ".join(page["text"] for page in pages)
                     content_type = "application/pdf"
                     title = urlsplit(final_url).path.rsplit("/", 1)[-1] or "Text PDF"
                 elif content_type in {"text/html", "application/xhtml+xml", "text/plain"}:
                     decoded = body.decode("utf-8", errors="replace")
                     if content_type == "text/plain":
-                        text = " ".join(decoded.split())
+                        text = decoded
                     else:
                         soup = BeautifulSoup(decoded, "html.parser")
                         title = soup.title.get_text(" ", strip=True) if soup.title else title
                         for element in soup(["script", "style", "noscript", "svg", "iframe"]):
                             element.decompose()
-                        text = " ".join(soup.get_text(" ", strip=True).split())
+                        text = soup.get_text(" ", strip=True)
                 else:
                     return {
                         "status": "failed",
@@ -106,6 +113,6 @@ async def fetch_public(url: str, *, max_bytes: int, max_pages: int, max_chars: i
                     "title": title,
                     "text": text[:max_chars],
                     "content_type": content_type,
-                    "page_number": page_number,
+                    "pages": pages,
                 }
     return {"status": "failed", "reason": "Fetch ended without content"}

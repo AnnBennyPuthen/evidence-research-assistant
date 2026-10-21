@@ -20,11 +20,20 @@ class ResearchRequest(BaseModel):
         return [domain.lower().strip().removeprefix("www.") for domain in domains if domain.strip()]
 
 
-class ResearchTask(BaseModel):
-    id: str = Field(default_factory=lambda: new_id("task"))
+class ResearchTaskDraft(BaseModel):
     question: str
     search_queries: list[str] = Field(max_length=4)
     success_criteria: list[str] = Field(max_length=4)
+
+
+class ResearchTask(ResearchTaskDraft):
+    id: str = Field(default_factory=lambda: new_id("task"))
+
+
+class ResearchPlanDraft(BaseModel):
+    overview: str
+    tasks: list[ResearchTaskDraft] = Field(min_length=1, max_length=3)
+    comparison_dimensions: list[str] = Field(default_factory=list, max_length=5)
 
 
 class ResearchPlan(BaseModel):
@@ -59,9 +68,12 @@ class EvidencePassage(BaseModel):
     usable: bool = True
 
 
-class CandidateClaim(BaseModel):
-    id: str = Field(default_factory=lambda: new_id("claim"))
+class CandidateClaimDraft(BaseModel):
     text: str
+
+
+class CandidateClaim(CandidateClaimDraft):
+    id: str = Field(default_factory=lambda: new_id("claim"))
     evidence_ids: list[str] = Field(default_factory=list)
 
 
@@ -109,6 +121,7 @@ class ReportFinding(BaseModel):
     claim_ids: list[str] = Field(default_factory=list)
     kind: Literal["evidence", "synthesis", "recommendation"] = "evidence"
     premise_claim_ids: list[str] = Field(default_factory=list)
+    qualification: Literal["supported", "conflicting", "insufficient"] = "supported"
 
 
 class Report(BaseModel):
@@ -138,7 +151,6 @@ class Usage(BaseModel):
     output_tokens: int | None = None
     search_requests: int = 0
     fetch_attempts: int = 0
-    cached_calls: int = 0
     cached_calls: int = 0
     elapsed_seconds: float = 0
     ended_by_limit: str | None = None
